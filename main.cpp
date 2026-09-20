@@ -23,7 +23,15 @@ struct FieldDef {
     uint64_t offset = 0;
     FieldType type = FieldType::Hex;
     int length = 0;
+    std::string group;
     std::vector<char> editBuffer;
+};
+
+struct TableItem {
+    bool isGroupStart = false;
+    bool isGroupEnd = false;
+    int fieldIndex = -1;
+    std::string groupName;
 };
 
 static std::string Trim(const std::string& s) {
@@ -33,15 +41,45 @@ static std::string Trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
-static std::vector<FieldDef> ParseDefinitionFile(const std::string& path) {
+struct ParseResult {
     std::vector<FieldDef> fields;
+    std::vector<TableItem> items;
+    std::string errors;
+};
+
+static ParseResult ParseDefinitionFile(const std::string& path) {
+    ParseResult result;
     std::ifstream file(path);
-    if (!file.is_open()) return fields;
+    if (!file.is_open()) {
+        result.errors = "Could not open file:\n" + path;
+        return result;
+    }
 
     std::string line;
+    int lineNum = 0;
     while (std::getline(file, line)) {
+        lineNum++;
         line = Trim(line);
         if (line.empty() || line[0] == '#' || line.substr(0, 2) == "//") continue;
+
+        if (line.find("@group") == 0) {
+            std::string rest = Trim(line.substr(6));
+            if (rest.size() >= 2 && rest.front() == '"' && rest.back() == '"')
+                rest = rest.substr(1, rest.size() - 2);
+
+            TableItem item;
+            item.isGroupStart = true;
+            item.groupName = rest;
+            result.items.push_back(item);
+            continue;
+        }
+
+        if (line.find("@endgroup") == 0) {
+            TableItem item;
+            item.isGroupEnd = true;
+            result.items.push_back(item);
+            continue;
+        }
 
         std::vector<std::string> parts;
         std::string current;
@@ -53,49 +91,75 @@ static std::vector<FieldDef> ParseDefinitionFile(const std::string& path) {
         }
         parts.push_back(Trim(current));
 
-        if (parts.size() < 4) continue;
+        if (parts.size() < 4) {
+            result.errors += "Line " + std::to_string(lineNum) + ": Expected 4 columns (name, desc, offset, type).\n";
+            continue;
+        }
 
         FieldDef f;
         f.name = parts[0];
         f.description = parts[1];
 
         std::string offStr = parts[2];
-        if (offStr.find("0x") == 0 || offStr.find("0X") == 0)
-            f.offset = std::stoull(offStr, nullptr, 16);
-        else
-            f.offset = std::stoull(offStr, nullptr, 10);
+        try {
+            size_t pos = 0;
+            if (offStr.find("0x") == 0 || offStr.find("0X") == 0)
+                f.offset = std::stoull(offStr, &pos, 16);
+            else
+                f.offset = std::stoull(offStr, &pos, 10);
+
+            if (pos != offStr.length()) throw std::invalid_argument("Trailing characters");
+        }
+        catch (...) {
+            result.errors += "Line " + std::to_string(lineNum) + ": Invalid offset '" + offStr + "'.\n";
+            continue;
+        }
 
         std::string typeStr = parts[3];
         std::transform(typeStr.begin(), typeStr.end(), typeStr.begin(), ::tolower);
 
-        if (typeStr.find("hex(") == 0) {
-            f.type = FieldType::Hex;
-            f.length = std::stoi(typeStr.substr(4, typeStr.find(')') - 4));
+        try {
+            if (typeStr.find("hex(") == 0 && typeStr.back() == ')') {
+                f.type = FieldType::Hex;
+                f.length = std::stoi(typeStr.substr(4, typeStr.length() - 5));
+            }
+            else if (typeStr.find("str(") == 0 && typeStr.back() == ')') {
+                f.type = FieldType::Str;
+                f.length = std::stoi(typeStr.substr(4, typeStr.length() - 5));
+            }
+            else if (typeStr == "i8") { f.type = FieldType::I8;  f.length = 1; }
+            else if (typeStr == "u8") { f.type = FieldType::U8;  f.length = 1; }
+            else if (typeStr == "i16") { f.type = FieldType::I16; f.length = 2; }
+            else if (typeStr == "u16") { f.type = FieldType::U16; f.length = 2; }
+            else if (typeStr == "i32") { f.type = FieldType::I32; f.length = 4; }
+            else if (typeStr == "u32") { f.type = FieldType::U32; f.length = 4; }
+            else if (typeStr == "i64") { f.type = FieldType::I64; f.length = 8; }
+            else if (typeStr == "u64") { f.type = FieldType::U64; f.length = 8; }
+            else {
+                result.errors += "Line " + std::to_string(lineNum) + ": Unknown type '" + typeStr + "'.\n";
+                continue;
+            }
         }
-        else if (typeStr.find("str(") == 0) {
-            f.type = FieldType::Str;
-            f.length = std::stoi(typeStr.substr(4, typeStr.find(')') - 4));
+        catch (...) {
+            result.errors += "Line " + std::to_string(lineNum) + ": Invalid type/length format '" + typeStr + "'.\n";
+            continue;
         }
-        else if (typeStr == "i8") { f.type = FieldType::I8;  f.length = 1; }
-        else if (typeStr == "u8") { f.type = FieldType::U8;  f.length = 1; }
-        else if (typeStr == "i16") { f.type = FieldType::I16; f.length = 2; }
-        else if (typeStr == "u16") { f.type = FieldType::U16; f.length = 2; }
-        else if (typeStr == "i32") { f.type = FieldType::I32; f.length = 4; }
-        else if (typeStr == "u32") { f.type = FieldType::U32; f.length = 4; }
-        else if (typeStr == "i64") { f.type = FieldType::I64; f.length = 8; }
-        else if (typeStr == "u64") { f.type = FieldType::U64; f.length = 8; }
-        else continue;
 
         int bufSize = (f.type == FieldType::Hex) ? (f.length * 2 + 1) : (f.length + 1);
         f.editBuffer.resize(bufSize, '\0');
-        fields.push_back(f);
+
+        TableItem item;
+        item.fieldIndex = (int)result.fields.size();
+        result.items.push_back(item);
+        result.fields.push_back(f);
     }
-    return fields;
+    return result;
 }
 
 struct AppState {
     std::vector<uint8_t> fileData;
     std::vector<FieldDef> fields;
+    std::vector<TableItem> tableItems;
     std::string binaryPath;
     int selectedFieldIndex = -1;
     int editingFieldIndex = -1;
@@ -248,9 +312,9 @@ static void DrawHexView() {
 }
 
 static void DrawTable() {
-    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
-                            ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | 
-                            ImGuiTableFlags_SizingFixedFit;
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_SizingFixedFit;
 
     if (ImGui::BeginTable("FieldsTable", 5, flags, ImVec2(0, 300))) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -261,34 +325,29 @@ static void DrawTable() {
         ImGui::TableSetupColumn("Value / Edit", ImGuiTableColumnFlags_WidthFixed, 150);
         ImGui::TableHeadersRow();
 
-        for (int i = 0; i < (int)g_AppState.fields.size(); i++) {
-            ImGui::PushID(i); 
+        auto DrawFieldRow = [&](int i) {
+            ImGui::PushID(i);
+
             auto& f = g_AppState.fields[i];
-            
+
             ImGui::TableNextRow();
             bool isSelected = (g_AppState.selectedFieldIndex == i);
 
             ImGui::TableSetColumnIndex(0);
 
-            if (ImGui::Selectable(
-                f.name.c_str(),
-                isSelected,
-                ImGuiSelectableFlags_SpanAllColumns |
-                ImGuiSelectableFlags_AllowOverlap
-            )) {
+            if (ImGui::Selectable(f.name.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                 if (g_AppState.selectedFieldIndex != i) {
                     g_AppState.editingFieldIndex = -1;
                 }
-
                 g_AppState.selectedFieldIndex = i;
             }
-            
+
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(f.description.c_str());
-            
+
             ImGui::TableNextColumn();
             ImGui::Text("0x%llX", f.offset);
-            
+
             ImGui::TableNextColumn();
             if (f.type == FieldType::Hex) ImGui::Text("hex(%d)", f.length);
             else if (f.type == FieldType::Str) ImGui::Text("str(%d)", f.length);
@@ -298,7 +357,6 @@ static void DrawTable() {
             }
 
             ImGui::TableSetColumnIndex(4);
-
             bool isEditing = (g_AppState.editingFieldIndex == i);
 
             if (f.offset + f.length > g_AppState.fileData.size()) {
@@ -306,71 +364,35 @@ static void DrawTable() {
             }
             else if (isEditing) {
                 uint8_t* ptr = g_AppState.fileData.data() + f.offset;
-
                 ImGui::SetNextItemWidth(-FLT_MIN);
 
                 if (f.type == FieldType::Hex) {
-
-                    ImGui::InputText(
-                        "##hex",
-                        f.editBuffer.data(),
-                        f.editBuffer.size(),
-                        ImGuiInputTextFlags_CharsHexadecimal
-                    );
-
+                    ImGui::InputText("##hex", f.editBuffer.data(), f.editBuffer.size(), ImGuiInputTextFlags_CharsHexadecimal);
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         std::string hexStr(f.editBuffer.data());
-
                         if (hexStr.length() == (size_t)(f.length * 2)) {
                             bool valid = true;
-
                             for (int b = 0; b < f.length; b++) {
-                                try {
-                                    ptr[b] = (uint8_t)std::stoi(
-                                        hexStr.substr(b * 2, 2),
-                                        nullptr,
-                                        16
-                                    );
-                                }
-                                catch (...) {
-                                    valid = false;
-                                    break;
-                                }
+                                try { ptr[b] = (uint8_t)std::stoi(hexStr.substr(b * 2, 2), nullptr, 16); }
+                                catch (...) { valid = false; break; }
                             }
-
-                            if (valid)
-                                g_AppState.dataModified = true;
+                            if (valid) g_AppState.dataModified = true;
                         }
-
                         g_AppState.editingFieldIndex = -1;
                     }
                 }
                 else if (f.type == FieldType::Str) {
-
-                    ImGui::InputText(
-                        "##str",
-                        f.editBuffer.data(),
-                        f.editBuffer.size()
-                    );
-
+                    ImGui::InputText("##str", f.editBuffer.data(), f.editBuffer.size());
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         std::string str(f.editBuffer.data());
-
                         memset(ptr, 0, f.length);
-                        memcpy(
-                            ptr,
-                            str.c_str(),
-                            std::min((int)str.length(), f.length)
-                        );
-
+                        memcpy(ptr, str.c_str(), std::min((int)str.length(), f.length));
                         g_AppState.dataModified = true;
                         g_AppState.editingFieldIndex = -1;
                     }
                 }
                 else {
-
                     ImGuiDataType imguiType;
-
                     switch (f.type) {
                     case FieldType::I8:  imguiType = ImGuiDataType_S8;  break;
                     case FieldType::U8:  imguiType = ImGuiDataType_U8;  break;
@@ -382,13 +404,7 @@ static void DrawTable() {
                     case FieldType::U64: imguiType = ImGuiDataType_U64; break;
                     default:             imguiType = ImGuiDataType_S32; break;
                     }
-
-                    ImGui::InputScalar(
-                        "##int",
-                        imguiType,
-                        (void*)ptr
-                    );
-
+                    ImGui::InputScalar("##int", imguiType, (void*)ptr);
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         g_AppState.dataModified = true;
                         g_AppState.editingFieldIndex = -1;
@@ -396,107 +412,65 @@ static void DrawTable() {
                 }
             }
             else {
-
                 if (f.type == FieldType::Hex || f.type == FieldType::Str) {
-
                     ImGui::TextUnformatted(f.editBuffer.data());
                 }
                 else {
-
                     uint8_t* ptr = g_AppState.fileData.data() + f.offset;
                     char intStr[32] = {};
-
                     switch (f.type) {
-                    case FieldType::I8:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%d",
-                            (int)*(int8_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::U8:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%u",
-                            (unsigned)*(uint8_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::I16:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%d",
-                            (int)*(int16_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::U16:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%u",
-                            (unsigned)*(uint16_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::I32:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%d",
-                            *(int32_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::U32:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%u",
-                            *(uint32_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::I64:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%lld",
-                            (long long)*(int64_t*)ptr
-                        );
-                        break;
-
-                    case FieldType::U64:
-                        snprintf(
-                            intStr,
-                            sizeof(intStr),
-                            "%llu",
-                            (unsigned long long) * (uint64_t*)ptr
-                        );
-                        break;
-
-                    default:
-                        break;
+                    case FieldType::I8:  snprintf(intStr, sizeof(intStr), "%d", (int)*(int8_t*)ptr); break;
+                    case FieldType::U8:  snprintf(intStr, sizeof(intStr), "%u", (unsigned)*(uint8_t*)ptr); break;
+                    case FieldType::I16: snprintf(intStr, sizeof(intStr), "%d", (int)*(int16_t*)ptr); break;
+                    case FieldType::U16: snprintf(intStr, sizeof(intStr), "%u", (unsigned)*(uint16_t*)ptr); break;
+                    case FieldType::I32: snprintf(intStr, sizeof(intStr), "%d", *(int32_t*)ptr); break;
+                    case FieldType::U32: snprintf(intStr, sizeof(intStr), "%u", *(uint32_t*)ptr); break;
+                    case FieldType::I64: snprintf(intStr, sizeof(intStr), "%lld", (long long)*(int64_t*)ptr); break;
+                    case FieldType::U64: snprintf(intStr, sizeof(intStr), "%llu", (unsigned long long) * (uint64_t*)ptr); break;
+                    default: break;
                     }
-
                     ImGui::TextUnformatted(intStr);
                 }
-
                 ImGui::SameLine();
-
                 if (ImGui::SmallButton("Edit")) {
                     g_AppState.selectedFieldIndex = i;
                     g_AppState.editingFieldIndex = i;
                     g_AppState.SyncFieldsFromData();
                 }
             }
-            
-            ImGui::PopID(); 
+
+            ImGui::PopID();
+
+        };
+
+        int currentGroupDepth = 0;
+        int openGroupDepth = 0;
+
+        for (const auto& item : g_AppState.tableItems) {
+            if (item.isGroupStart) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+
+                bool open = ImGui::TreeNodeEx(item.groupName.c_str(), ImGuiTreeNodeFlags_SpanFullWidth);
+                if (open) openGroupDepth++;
+                currentGroupDepth++;
+            }
+            else if (item.isGroupEnd) {
+                if (currentGroupDepth > 0) {
+                    currentGroupDepth--;
+                    if (openGroupDepth > currentGroupDepth) {
+                        ImGui::TreePop();
+                        openGroupDepth--;
+                    }
+                }
+            }
+            else {
+                if (openGroupDepth == currentGroupDepth) {
+                    DrawFieldRow(item.fieldIndex);
+                }
+            }
         }
+
         ImGui::EndTable();
     }
 }
@@ -613,8 +587,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (ImGui::Button("Open Definition")) {
             std::string path = OpenFileDialog(hwnd, "Rapid Struct Definition (*.rs)\0*.rs\0");
             if (!path.empty()) {
-                g_AppState.fields = ParseDefinitionFile(path);
+                auto res = ParseDefinitionFile(path);
+                g_AppState.fields = std::move(res.fields);
+                g_AppState.tableItems = std::move(res.items);
                 g_AppState.SyncFieldsFromData();
+
+                if (!res.errors.empty()) {
+                    MessageBoxA(hwnd, res.errors.c_str(), "Definition Parse Errors", MB_OK | MB_ICONWARNING);
+                }
             }
         }
         ImGui::SameLine();
