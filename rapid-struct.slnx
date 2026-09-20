@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="rapid-struct.vcxproj" Id="6f75d295-e813-484d-9fb1-5a7c6f2b24a1" />
+</Solution>
